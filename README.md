@@ -9,6 +9,7 @@ Research phase. No code yet.
 ## Research
 
 - [001 — Frontend Tech Stack](./docs/research/001-frontend-tech-stack/README.md) — Framework selection for the portal SPA
+- [002 — API Layer & Backend Architecture](./docs/research/002-api-layer/README.md) — Go BFF with REST (OpenAPI) + SSE
 
 ## Architecture
 
