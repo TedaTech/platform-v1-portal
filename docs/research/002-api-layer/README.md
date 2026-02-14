@@ -2,7 +2,7 @@
 
 **Issue:** [platform-v1-portal#2](https://github.com/TedaTech/platform-v1-portal/issues/2)
 **Date:** 2026-02-14
-**Status:** Proposed
+**Status:** Under Revision — see [revision-plan.md](revision-plan.md)
 
 ## Recommendation
 
@@ -60,7 +60,22 @@ oidc-spa (Keycloak)         orval (TS client codegen)
 | [Sequence Diagrams](sequence-diagrams.md) | Registration, provisioning, pipelines, billing flows |
 | [Scoring Matrix](scoring-matrix.md) | Weighted scoring with hard filters and sensitivity analysis |
 | [ADR-002](adr-002-api-layer.md) | Architecture Decision Record |
+| [Revision Plan](revision-plan.md) | Proposed architectural changes: GitOps-first, Keycloak authz, database |
 | [Draft API Contract](draft-api-contract.md) | OpenAPI 3.0 endpoint specifications |
+
+## Pending Revision
+
+The following architectural changes are proposed in [revision-plan.md](revision-plan.md):
+
+| Area | Current | Proposed |
+|------|---------|----------|
+| Provisioning | BFF writes CRDs directly to K8s | BFF commits to Forgejo → Flux → Crossplane |
+| CRD model | Multiple CRDs per tenant, created individually | Single `PortalTenant` composite CRD |
+| Authorization | Hard-coded `HasRole()` in BFF Go code | Keycloak Authorization Services + K8s RBAC |
+| BFF K8s access | Read-write ClusterRole | Read-only ClusterRole |
+| Database | None | Deferred; interface prepared for user prefs / app settings |
+
+These changes affect most documents in this directory. See the revision plan for the full update list and priority order.
 
 ## Impact on Other Issues
 
