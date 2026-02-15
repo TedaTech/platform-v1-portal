@@ -188,6 +188,48 @@ Based on the analysis, three viable architectures emerge:
 - Heavy microservices architecture (MongoDB + Redis + multiple services)
 - Despite strong marketing features, the SSO and database constraints are disqualifying
 
+### 4.1 Code-First Entity Management (GitOps Readiness)
+
+A hard requirement is that entity structures are **fully managed in code** — defined in version-controlled files and deployed via CI/CD, not created through a UI.
+
+| Dimension | EspoCRM | Twenty CRM | SuiteCRM | Mautic |
+|---|---|---|---|---|
+| **Definition format** | JSON files | TypeScript decorators (standard objects) / DB metadata (custom objects) | PHP vardef arrays | Doctrine PHP entities (core) / DB-only (custom fields) |
+| **Definitions in files?** | Yes — fully file-based JSON | Standard: Yes. Custom: No (DB only) | Yes — PHP vardef files | Plugin entities: Yes. Custom fields: No |
+| **Schema management API** | Yes (`/api/v1/Admin/fieldManager/`) | Yes (GraphQL metadata API) | No | Yes (REST `/api/fields/`) |
+| **CLI for applying changes** | `php command.php rebuild` | `yarn command:prod workspace:sync-metadata -f` | Community `repair.php` scripts | `bin/console doctrine:schema:update` |
+| **Extension packaging** | Yes — zip with `manifest.json`, CLI install via `php command.php extension` | N/A (modify source directly) | Yes — Module Loader zip | Yes — Composer plugins with migrations |
+| **GitOps readiness** | **Strong** | **Strong** (standard), Moderate (custom) | **Moderate** | **Moderate** (plugins), Weak (custom fields) |
+
+#### EspoCRM: How code-first works
+
+Entity definitions live as JSON files in a layered directory structure:
+
+```
+custom/Espo/Modules/{YourModule}/Resources/
+├── metadata/
+│   ├── entityDefs/{EntityName}.json    # fields, links, indexes
+│   ├── scopes/{EntityName}.json        # visibility, ACL, stream
+│   └── clientDefs/{EntityName}.json    # frontend configuration
+└── layouts/{EntityName}/
+    ├── detail.json
+    └── list.json
+```
+
+The recommended workflow:
+1. Define entities as JSON files in a custom module directory
+2. Version-control the module in Git
+3. Package using [espocrm/ext-template](https://github.com/espocrm/ext-template) tooling
+4. Deploy: `php command.php extension --file="package.zip" && php command.php rebuild`
+
+This approach cleanly separates code-managed definitions (in `custom/Espo/Modules/`) from any UI-generated changes (in `custom/Espo/Custom/`). The `rebuild` command applies database schema changes from the JSON definitions.
+
+#### Why EspoCRM wins for code-first
+
+- **Twenty** has excellent code-first for *standard* objects (TypeScript decorators + migrations), but *custom* objects (the kind we'd create for tenant events, workflow outcomes) live only in DB metadata tables with no file export. We would need to drive custom object creation via GraphQL API calls in CI/CD — imperative, not declarative.
+- **SuiteCRM** has version-controllable PHP vardefs, but no schema management API and relies on community-maintained CLI repair scripts. The dual source of truth (files + `fields_meta_data` table) creates drift risk.
+- **Mautic** custom fields are DB-only with no file representation. Plugin entities use Doctrine and are code-first, but the primary extension mechanism (custom fields on contacts) cannot be version-controlled as files.
+
 ---
 
 ## 5. Evaluation Matrix
