@@ -59,9 +59,10 @@ Temporal Cluster (self-hosted on K8s):
 Persistence: PostgreSQL (shared cluster, dedicated database)
 Visibility:  PostgreSQL (same cluster, dedicated database or schema)
 
-Workers (application code):
-  portal-worker     -- handles all portal workflows (onboarding, app upgrade, GDPR erasure)
-                    -- additional workers can be split out later if needed
+Workers (application code, one per workflow type):
+  worker-onboarding  -- onboarding workflow + its activities
+  worker-upgrade     -- app upgrade workflow + its activities
+  worker-gdpr        -- GDPR erasure workflow + its activities
 ```
 
 **Resource estimate (low-concurrency starting point):**
@@ -73,7 +74,7 @@ Workers (application code):
 | Matching | 0.25 core | 256 Mi | 1 |
 | Worker | 0.25 core | 256 Mi | 1 |
 | **Total Temporal** | **1.5 cores** | **1.5 Gi** | **4 pods** |
-| Application worker | 0.5 core | 256 Mi | 1 pod |
+| Application workers | 0.25 core each | 256 Mi each | 3 pods (1 per workflow type) |
 
 Scale replicas as concurrency grows. Temporal's history service can be sharded across replicas when needed.
 
@@ -126,21 +127,9 @@ The portal (BFF) does not own a database. It reads from Temporal, KillBill, Open
 
 ### 4. Flagger for Progressive App Delivery
 
-App upgrades orchestrated by Temporal use Flagger for the traffic-shifting phase:
+App upgrades use Flagger for the canary/blue-green traffic-shifting phase. Flagger adds one CRD (`Canary`) to the cluster and handles metrics-driven canary analysis. Temporal orchestrates the full lifecycle around it (backup, commit, monitor, rollback).
 
-```
-Temporal Workflow: "app_upgrade"
-  1. Activity: create backup (K8s Job via GitOps commit)
-  2. Activity: wait for backup completion (poll Job status)
-  3. Activity: commit new app version to GitOps repo
-  4. Activity: Flux reconciles, Flagger begins canary rollout
-  5. Activity: poll Flagger Canary status (progressive traffic shift)
-  6. Activity: if Flagger promotes → [CRM] record success
-  7. Activity: if Flagger rolls back → [CRM] record failure, notify user
-  8. Signal: user can manually promote or rollback at any step
-```
-
-Flagger adds one CRD (`Canary`) to the cluster. Traffic shifting is based on Kubernetes Gateway API or Istio/Linkerd service mesh metrics. Flagger handles the mechanics of canary analysis; Temporal orchestrates the full lifecycle around it.
+The specifics of how Temporal and Flagger interact will be designed when the app upgrade workflow is implemented.
 
 ### 5. CRM and Email: External System, Not Portal-Owned
 
@@ -164,7 +153,7 @@ CRM (customer timeline, interaction tracking) and email (welcome, payment remind
 
 **Reference-based payloads still apply.** Regardless of CRM choice, Temporal workflow inputs must use reference IDs (Keycloak user IDs, KillBill account refs), never PII. The CRM resolves references to display names at read time.
 
-### 7. Compliance Architecture
+### 6. Compliance Architecture
 
 Three-layer data separation enforced from day one:
 
@@ -215,50 +204,9 @@ func (a *Activities) SendWelcomeEmail(ctx context.Context, input SendEmailInput)
 }
 ```
 
-**Workflow RBAC (extending Keycloak groups from ADR-002):**
+**Workflow RBAC** will extend the existing Keycloak group model from ADR-002. The BFF validates Keycloak token group claims before proxying any workflow operation to Temporal. Specific workflow permission groups and mappings will be defined when workflows are implemented.
 
-| Keycloak Group | Permissions |
-|---|---|
-| `platform-workflow-viewer` | View workflow executions across all tenants |
-| `platform-workflow-operator` | Trigger, signal, retry, cancel workflows across all tenants |
-| `platform-workflow-admin` | Deploy workflow definitions, manage schedules, configure retention |
-| `{tenant}-view` (existing) | View workflow status and CRM timeline for own tenant |
-| `{tenant}-admin` (existing) | Trigger tenant-scoped workflows (request upgrade, etc.) |
-
-The BFF validates Keycloak token group claims before proxying any workflow operation to Temporal.
-
-### 8. Portal Visibility into Workflows
-
-The portal frontend displays workflow state and CRM data using Refine's `liveProvider` (from ADR-001) connected to the BFF via WebSocket/SSE:
-
-```
-User Experience:
-
-Tenant Dashboard:
-  - CRM timeline: scrollable feed of all events for this tenant (read from external CRM)
-  - Active workflows: cards showing current step, progress, duration (read from Temporal)
-  - App status: current version, last upgrade result, next scheduled backup
-  - Cost overview: OpenCost data for this tenant
-  - Billing status: KillBill subscription, invoices, payment status
-
-App Upgrade View:
-  - Step indicator: backup → canary 10% → canary 50% → canary 100% → promoted
-  - Live metrics: error rate, latency (from Flagger's canary analysis)
-  - Manual controls: "Promote now" / "Rollback" buttons (trigger Temporal signals)
-  - History: previous upgrades with outcome and duration
-
-BFF Implementation:
-  - GET  /api/v1/tenants/{id}/timeline       → read from external CRM (API TBD)
-  - GET  /api/v1/tenants/{id}/costs          → read from OpenCost
-  - GET  /api/v1/tenants/{id}/billing        → read from KillBill
-  - GET  /api/v1/workflows/{id}/status       → Temporal QueryWorkflow
-  - POST /api/v1/workflows/{id}/signal/{name} → Temporal SignalWorkflow
-  - WS   /api/v1/tenants/{id}/events         → stream workflow updates (+ CRM if live-capable)
-```
-
-**Live updates depend on CRM choice.** If the CRM uses PostgreSQL on the same cluster, the BFF can use LISTEN/NOTIFY for near-real-time timeline updates. If the CRM is SaaS-based, the BFF may need to poll or receive webhooks. Temporal workflow status is always live via Temporal queries.
-
-### 9. Monorepo: Frontend, BFF, and Workers in One Repository
+### 7. Monorepo: Frontend, BFF, and Workers in One Repository
 
 The React frontend, Go BFF, and all Temporal workers live in a single repository (`platform-v1-portal`). Each is a separate build target producing a separate container image, but they share one git history, one CI pipeline, and one PR review process.
 
@@ -275,7 +223,11 @@ platform-v1-portal/
   cmd/                         # Go binary entry points
     bff/                       # BFF server (HTTP/WS + Temporal client)
       main.go
-    worker/                    # Temporal worker (all workflows + activities)
+    worker-onboarding/         # Onboarding workflow worker
+      main.go
+    worker-upgrade/            # App upgrade workflow worker
+      main.go
+    worker-gdpr/               # GDPR erasure workflow worker
       main.go
 
   internal/                    # Shared Go packages (not importable externally)
@@ -287,7 +239,6 @@ platform-v1-portal/
       keycloak/                # Keycloak user resolution
       killbill/                # KillBill billing operations
       gitops/                  # Git commit to GitOps repo
-      flagger/                 # Canary status polling
       k8s/                     # Kubernetes API operations
     auth/                      # Keycloak token validation, RBAC checks
     config/                    # Shared configuration loading
@@ -296,10 +247,11 @@ platform-v1-portal/
 
   go.mod                       # Single Go module
   go.sum
-  Makefile                     # Build targets: make bff, make worker-lifecycle, etc.
-  Dockerfile.bff               # Multi-stage: build Go → scratch/distroless
-  Dockerfile.worker            # Shared base for all workers (arg selects cmd/)
+  Makefile                     # Build targets: make bff, make worker, etc.
+  Dockerfile                   # Build strategy TBD (see note below)
 ```
+
+**Dockerfile strategy (TBD):** Research whether a single Dockerfile with multiple build targets (multi-stage with `--target`) is better than separate Dockerfiles per component. A single Dockerfile can share build cache (Go module download, compilation of shared packages) but may be harder to read. Separate Dockerfiles are simpler but duplicate cache layers. Best practices and common monorepo patterns should be evaluated before choosing.
 
 **Why monorepo over multi-repo:**
 
@@ -319,9 +271,13 @@ Despite being a monorepo, each component builds and deploys independently:
 
 - `make frontend` → builds React SPA, produces `portal-frontend:sha` image
 - `make bff` → builds Go BFF binary, produces `portal-bff:sha` image
-- `make worker` → builds Temporal worker, produces `portal-worker:sha` image
+- `make worker-onboarding` → produces `portal-worker-onboarding:sha` image
+- `make worker-upgrade` → produces `portal-worker-upgrade:sha` image
+- `make worker-gdpr` → produces `portal-worker-gdpr:sha` image
 - CI detects which paths changed and only builds/deploys affected images
-- Flux watches each image independently (frontend, BFF, and worker can roll out at different times)
+- Flux watches each image independently
+
+Each worker is a separate build because workers have different workflow dependencies, activity registrations, and potentially different resource profiles. Since we already have multiple build targets (BFF + frontend), adding more workers is low incremental cost.
 
 **Temporal type safety across BFF and workers:**
 
@@ -339,7 +295,7 @@ type AppUpgradeInput struct {
 // cmd/bff/main.go — starts the workflow
 client.ExecuteWorkflow(ctx, opts, app_upgrade.Workflow, input)
 
-// cmd/worker/main.go — registers the workflow
+// cmd/worker-upgrade/main.go — registers only its workflow
 w.RegisterWorkflow(app_upgrade.Workflow)
 ```
 
@@ -370,7 +326,6 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 |---|---|
 | Temporal cluster failure halts all workflows | Temporal is designed for HA (multiple replicas per service). In-flight workflows resume automatically on recovery. Start with single replicas, scale to HA before production. |
 | PostgreSQL overload from shared usage | Logical separation (separate databases) prevents query interference. Monitor connection pools and query performance. Split into separate clusters if needed. |
-| Flagger canary analysis produces false positives/negatives | Start with conservative thresholds. Temporal workflow allows manual override via signal. Iterate on metrics and thresholds over time. |
 | CRM choice blocks portal timeline feature | The BFF's timeline display and live updates depend on CRM choice. Mitigate by defining a minimal CRM read interface early; swap implementations behind it. |
 | Reference-based payload discipline slips | Enforce via code review + linting rules that flag string fields matching PII patterns in workflow/activity input structs. CI check prevents merge. |
 
@@ -387,4 +342,4 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 - [Workflow Catalog](./workflow-catalog.md)
 - [Temporal Documentation](https://docs.temporal.io/)
 - [Temporal Go SDK](https://github.com/temporalio/sdk-go)
-- [Flagger Documentation](https://docs.flagger.app/)
+- [Flagger Documentation](https://docs.flagger.app/) (progressive delivery, details deferred)
