@@ -1,6 +1,8 @@
 # Compliance Architecture
 
-Patterns and controls for GDPR, SOC 2 Type II, and ISO 27001 compliance in the context of Temporal workflow orchestration, CRM tracking, and the platform's GitOps architecture.
+Patterns and controls for GDPR, SOC 2 Type II, and ISO 27001 compliance in the context of Temporal workflow orchestration and the platform's GitOps architecture.
+
+**Note:** CRM and email are external systems (choice TBD). This document covers compliance for the portal and Temporal. The CRM system will have its own compliance requirements depending on the choice made.
 
 ## Three-Layer Data Separation
 
@@ -24,11 +26,12 @@ The fundamental compliance pattern: separate mutable PII from immutable audit re
 │  │  NO email, NO name, NO billing details        │          │
 │  └──────────────────────────────────────────────┘           │
 ├─────────────────────────────────────────────────────────────┤
-│  Layer 2: Audit / CRM Log (Append-Only, Immutable)          │
+│  Layer 2: Audit / CRM Log (External CRM System)             │
 │  ┌──────────────────────────────────────────────┐           │
-│  │          Portal PostgreSQL (crm_timeline)     │          │
+│  │          External CRM (choice TBD)            │          │
 │  │  who (actor_ref), what (event_type)           │          │
 │  │  when (timestamp), outcome, workflow_id       │          │
+│  │  Owned by CRM, read by portal BFF            │          │
 │  │  NO email, NO name, NO billing details        │          │
 │  └──────────────────────────────────────────────┘           │
 └─────────────────────────────────────────────────────────────┘
@@ -53,43 +56,26 @@ GDPR Article 30 requires documenting each processing activity. Each workflow map
 
 ### Consent Management (Marketing Workflows)
 
-Marketing email workflows (re-engagement campaigns) require the strictest handling:
+Marketing consent management is the CRM system's responsibility (choice TBD). The portal onboarding wizard collects initial consent preferences and passes them to the CRM. The CRM system manages the full consent lifecycle:
 
-```
-Consent Lifecycle:
+- **Collection**: explicit opt-in during onboarding (portal passes consent to CRM)
+- **Verification**: CRM checks consent before every marketing email send
+- **Withdrawal**: user unsubscribes via CRM mechanism; CRM halts active campaigns
+- **Annual refresh**: CRM manages re-permission workflows
 
-1. Collection
-   - Explicit opt-in during onboarding (separate checkbox, not bundled with ToS)
-   - Record: { user_ref, purpose: "marketing_email", granted_at, source, terms_version }
-   - Store consent record in portal database (separate from Keycloak profile)
-
-2. Verification (before every email send)
-   - Workflow activity checks consent status BEFORE resolving email from Keycloak
-   - If consent withdrawn since last check → skip send, record "skipped.no_consent"
-   - If user on suppression list → skip send, record "skipped.suppressed"
-
-3. Withdrawal
-   - User clicks "unsubscribe" → BFF records withdrawal → BFF signals all active
-     campaign workflows for this user → workflows stop before next send
-   - Withdrawal must be as easy as granting consent (one click)
-   - Record: { user_ref, purpose: "marketing_email", withdrawn_at, source }
-
-4. Annual Refresh
-   - Yearly workflow sends re-permission email to confirm ongoing consent
-   - No response within 30 days → automatically withdraw consent
-```
+The portal's only role in consent is displaying the user's current consent status (read from CRM) and passing initial consent preferences during onboarding.
 
 ### Data Retention Policies
 
 | Data Type | Store | Retention | Cleanup Mechanism |
 |---|---|---|---|
 | Temporal workflow history | Temporal PostgreSQL | 24 months | Temporal namespace retention policy (automatic) |
-| CRM timeline events | Portal PostgreSQL | 36 months (general), 7 years (payment) | Table partitioning by `created_at`, drop old partitions |
-| Consent records | Portal PostgreSQL | Relationship duration + 36 months | Manual review (must prove consent was valid when used) |
+| CRM timeline events | External CRM | Governed by CRM system | CRM system's retention policy |
+| Consent records | External CRM or dedicated store | Relationship duration + 36 months | Manual review (must prove consent was valid when used) |
 | Keycloak user records | Keycloak | Until erasure request | GDPR erasure workflow |
 | KillBill billing records | KillBill PostgreSQL | 7 years (tax/financial obligation) | Anonymize after retention period (keep amounts, remove identity) |
 | Git commit history (GitOps) | Forgejo | Indefinite (audit trail) | Contains no PII (tenant IDs and resource specs only) |
-| SendGrid delivery logs | SendGrid (external) | Per SendGrid retention | SendGrid DPA governs; platform keeps own copy in CRM timeline |
+| Email delivery logs | External CRM / email provider | Per provider retention | Provider DPA governs |
 
 ### Cross-Border Data Transfer
 
@@ -99,14 +85,14 @@ Consent Lifecycle:
 | PostgreSQL | Self-hosted (same cluster) | Same region as cluster | No |
 | Keycloak | Self-hosted (Cozystack) | Same region as cluster | No |
 | KillBill | Self-hosted (same cluster) | Same region as cluster | No |
-| SendGrid | External SaaS | SendGrid data centers | **Yes** -- sign SendGrid DPA, verify EU processing |
 | Forgejo | Self-hosted | Same region as cluster | No |
+| CRM system | TBD (depends on choice) | TBD | **TBD** -- if external SaaS, DPA required |
+| Email provider | TBD (depends on CRM choice) | TBD | **TBD** -- if external SaaS, DPA required |
 
-**SendGrid is the only external processor.** Ensure:
-- SendGrid Data Processing Addendum (DPA) is signed
+**External processor DPAs depend on CRM choice.** If the CRM or email provider is SaaS-based, ensure:
+- Data Processing Addendum (DPA) is signed
 - EU data processing region is selected if available
 - Standard Contractual Clauses (SCCs) are in place for any non-EU processing
-- Platform's own CRM timeline records email events independently of SendGrid's logs
 
 ## SOC 2 Type II Controls
 
@@ -122,8 +108,7 @@ Consent Lifecycle:
 | Temporal admin (tctl) | Kubernetes RBAC, restricted to platform-workflow-admin |
 | PostgreSQL | Database-level roles, connection restricted to K8s service accounts |
 | GitOps repo | Forgejo authentication, branch protection rules |
-| CRM timeline (write) | Only application service accounts via prepared statements |
-| CRM timeline (read) | BFF validates tenant membership before returning events |
+| External CRM (read) | BFF validates tenant membership before proxying CRM reads |
 
 **CC6.3 -- Role-based access:**
 
@@ -143,12 +128,11 @@ Cancel workflow                     |             |              |           |  
 Deploy workflow definitions         |             |              |           |             |    Y     |       Y
 Modify retention policies           |             |              |           |             |    Y     |       Y
 Access Temporal admin CLI           |             |              |           |             |    Y     |       Y
-Delete audit logs                   |             |              |           |             |          |
 
 * tenant-admin can signal only their own tenant's workflows
 
-Note: No role can delete audit logs. This is enforced at the PostgreSQL level
-(application service account has INSERT only, no UPDATE or DELETE on crm_timeline).
+Note: CRM timeline access is governed by the BFF (validates tenant membership before
+proxying reads from the external CRM). CRM write permissions are the CRM system's concern.
 ```
 
 ### CC7: System Operations and Monitoring
@@ -175,8 +159,7 @@ Every workflow operation generates an audit event:
 | Service suspended | ServiceDisable workflow completes | High | Platform ops + tenant |
 | Unauthorized access attempt | BFF rejects workflow operation due to RBAC | High | Security team |
 | Workflow engine unhealthy | Temporal frontend health check fails | Critical | Platform ops |
-| Audit log write failure | CRM timeline INSERT fails | Critical | Platform ops + security |
-| Email delivery failure (sustained) | 3+ consecutive SendGrid failures | High | Platform ops |
+| CRM integration failure | [CRM] activity fails after retries | High | Platform ops |
 
 ### CC8: Change Management
 
@@ -224,7 +207,7 @@ Audit trail:
 - Git branch protection: PRs require at least one approving review from a different user
 - Flux CD: deployment is automated, no human can deploy directly
 - Keycloak groups: operators cannot modify workflow code, developers cannot trigger production workflows (unless also assigned operator role)
-- PostgreSQL permissions: audit log table has INSERT-only access for application, no user has DELETE
+- Temporal: workflow event history is immutable by design (event sourcing)
 
 **For small teams:** If full segregation is impractical, compensating controls apply:
 - Enhanced audit logging (all actions logged with full context)
@@ -245,11 +228,12 @@ Every log entry records:
 | **Outcome** | Result of the action | `success`, `failed:insufficient_permissions`, `failed:timeout` |
 
 **Log protection:**
-- Application service accounts: INSERT only on `crm_timeline`, no UPDATE or DELETE
+- Temporal workflow history: immutable event sourcing (Temporal enforces this)
 - Log aggregation pipeline (e.g., Loki): separate write and read credentials
 - Platform operators: read access to logs, no delete capability
 - Security team: full read access, delete only via documented retention policy execution
-- Backup: logs included in PostgreSQL backup schedule
+- Backup: Temporal PostgreSQL included in cluster backup schedule
+- CRM audit logs: governed by the CRM system's own access controls
 
 ### 8.14 -- Business Continuity
 
@@ -269,7 +253,7 @@ Every log entry records:
 | Temporal cluster | < 5 minutes | 0 (PostgreSQL durability) | K8s self-healing + liveness probes |
 | PostgreSQL | < 5 minutes | < 1 minute | Streaming replication + automated failover |
 | Application workers | < 2 minutes | 0 (stateless, Temporal has the state) | K8s Deployment restart |
-| Audit log | < 5 minutes | < 1 minute | Same PostgreSQL HA |
+| External CRM | Depends on CRM choice | Depends on CRM choice | CRM system's HA mechanism |
 
 ### 8.17 -- Clock Synchronization
 
@@ -279,7 +263,7 @@ All components must use synchronized NTP for audit log consistency:
 - Temporal: uses host clock (synchronized via K8s node)
 - PostgreSQL: `now()` uses host clock
 - Application workers: use host clock for timestamps
-- CRM timeline: `created_at DEFAULT now()` uses PostgreSQL server time (single source of truth for event ordering)
+- CRM system: clock sync depends on CRM deployment (self-hosted = same NTP, SaaS = provider's responsibility)
 
 Verify: `SELECT now()` on PostgreSQL matches `date -u` on K8s nodes within 1 second.
 
@@ -290,17 +274,17 @@ During a SOC 2 Type II audit, auditors will request evidence for a 12-month peri
 | Evidence | Source | How to Extract |
 |---|---|---|
 | Access control configuration | Keycloak group memberships, K8s RoleBindings | Keycloak admin API export, `kubectl get rolebindings` |
-| Access grant/revocation records | Keycloak audit log, CRM timeline (`auth.*` events) | Keycloak admin console, portal database query |
+| Access grant/revocation records | Keycloak audit log | Keycloak admin console |
 | Change management records | Git history (PRs, reviews, merges) | `git log`, Forgejo PR export |
 | Deployment history | Flux reconciliation logs, container image history | `flux get all`, container registry API |
-| Incident detection records | CRM timeline, monitoring alerts | Portal database query, alerting system export |
-| Data processing records | CRM timeline (all workflow events) | Portal database query with date range filter |
-| Retention policy enforcement | Temporal namespace config, PostgreSQL partition drops | `tctl namespace describe`, PostgreSQL admin logs |
+| Incident detection records | Monitoring alerts, Temporal workflow failures | Alerting system export, Temporal visibility queries |
+| Data processing records | Temporal workflow history, external CRM | Temporal visibility queries, CRM export (depends on choice) |
+| Retention policy enforcement | Temporal namespace config | `tctl namespace describe` |
 
 **Retention requirement:** All evidence sources must retain data for at least 12 months. Configure:
 - Keycloak audit log retention: 12+ months
 - Temporal namespace retention: 24 months
-- CRM timeline: 36+ months
+- CRM retention: governed by CRM system (ensure 36+ months for audit evidence)
 - Git history: indefinite (default)
 - Container image tags: 12+ months (do not prune old tags within audit window)
 

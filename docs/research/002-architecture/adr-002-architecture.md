@@ -15,7 +15,7 @@ The Customer Portal needs to:
 - Allow users to create and remove tenants on the hosting platform
 - Integrate with the existing GitOps/Flux-managed infrastructure
 - Act as the glue between billing (KillBill), the frontend, and the Kubernetes API
-- Connect Kubernetes OpenCost to the billing system
+- Make OpenCost and KillBill data visible to users (display, not integration)
 - Scale to the initial sales target (< 1,000 tenants)
 
 The platform runs on a single Kubernetes cluster managed by Cozystack, with Flux watching a central gitops repo for infrastructure state.
@@ -33,7 +33,7 @@ The platform runs on a single Kubernetes cluster managed by Cozystack, with Flux
 
 Users authenticate via the existing `cozy` Keycloak realm. The portal is a standard OIDC client in this realm. Kubernetes RBAC -- driven by Keycloak group membership -- determines what each user can see and do.
 
-The BFF is the glue between the frontend, Kubernetes API, and billing (KillBill). It validates tokens, proxies requests, manages tenant lifecycle, and connects OpenCost to billing. All permission decisions are made by Kubernetes RBAC.
+The BFF is the glue between the frontend, Kubernetes API, and billing (KillBill). It validates tokens, proxies requests, starts Temporal workflows for tenant lifecycle operations, and makes OpenCost and KillBill data visible to users. All permission decisions are made by Kubernetes RBAC.
 
 **Keycloak groups per tenant (created by Cozystack):**
 - `{tenant}-view` -- read-only access
@@ -41,20 +41,23 @@ The BFF is the glue between the frontend, Kubernetes API, and billing (KillBill)
 - `{tenant}-admin` -- use + CRUD on applications
 - `{tenant}-super-admin` -- admin + sub-tenant management
 
-### 2. Tenant Provisioning: BFF Commits to GitOps Repo
+### 2. Tenant Provisioning: BFF Starts Temporal Workflow
 
-The BFF commits a single Kubernetes resource per tenant to the main gitops repo (one file per tenant, with all tenant configuration contained in this resource). The exact resource type is TBD but Flux reconciles these into Cozystack tenants.
+The BFF starts a Temporal workflow for tenant creation. A Temporal worker activity commits a single Kubernetes resource per tenant to the main gitops repo (one file per tenant). The exact resource type is TBD but Flux reconciles these into Cozystack tenants.
 
 ```
 User clicks "Create Tenant" in portal
   --> BFF validates token + RBAC
-  --> BFF commits tenant resource YAML to gitops repo (one file per tenant)
+  --> BFF starts Temporal onboarding workflow
+  --> Temporal worker activity commits tenant resource YAML to gitops repo
   --> Flux detects change, reconciles
   --> Cozystack creates namespace, RBAC, Keycloak groups, network policies
-  --> Portal shows tenant status via Kubernetes API watch
+  --> Portal shows workflow progress + tenant status via Temporal queries
 ```
 
-Tenant removal follows the same path in reverse: BFF removes the tenant resource from git, Flux prunes the resources.
+Tenant removal follows the same path in reverse: BFF starts a removal workflow, Temporal activity removes the tenant resource from git, Flux prunes the resources.
+
+**Note:** ADR-003 details the Temporal workflow architecture. The BFF writes only to Temporal; all GitOps commits, external API calls, and side effects happen inside Temporal worker activities.
 
 ### 3. No Per-Tenant Portal (MVP)
 
@@ -78,7 +81,7 @@ The portal accepts Keycloak's default token behavior. Group claims are included 
 - Zero custom auth code -- all authentication and authorization handled by battle-tested infrastructure (Keycloak + Kubernetes RBAC)
 - GitOps-native provisioning -- full audit trail in git, rollback via git revert, no imperative state drift
 - Cozystack-aligned -- tenants created by the portal are identical to tenants created manually, no shadow state
-- BFF as integration layer -- the backend connects billing (KillBill), OpenCost, the frontend, and K8s API. No user database, no session store, no permission tables
+- BFF as thin gateway -- the backend reads from OpenCost, KillBill, Temporal, and an external CRM. It writes only to Temporal (to start/signal workflows). No user database, no session store, no permission tables
 
 ### Negative
 
@@ -98,7 +101,7 @@ The portal accepts Keycloak's default token behavior. Group claims are included 
 
 - **Issue #1 (Frontend)**: SPA uses `oidc-spa` to authenticate against the `cozy` Keycloak realm. TanStack Router adapter handles protected routes.
 - **Issue #3 (Keycloak)**: No custom realm needed. Portal is an OIDC client in the `cozy` realm. Keycloakify themes apply to the `cozy` realm login page.
-- **Issue #6 (Onboarding)**: Onboarding wizard submits to BFF, which commits tenant resource to gitops repo. Real-time status via Kubernetes API watch through Refine's `liveProvider`.
+- **Issue #6 (Onboarding)**: Onboarding wizard submits to BFF, which starts a Temporal onboarding workflow. Real-time status via Temporal workflow queries through Refine's `liveProvider`.
 
 ## References
 

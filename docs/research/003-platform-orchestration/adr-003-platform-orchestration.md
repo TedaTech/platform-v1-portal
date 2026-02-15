@@ -24,10 +24,9 @@ ADR-002 established that the BFF commits resources to a GitOps repo and Flux rec
 
 ## Decision Drivers
 
-- **CRM from day one**: every customer-facing interaction must be tracked and visible in the portal. Retrofitting communication tracking later is expensive and loses historical data
 - **Full app lifecycle visibility**: users and platform operators must see exactly where an upgrade is (backup in progress, canary at 10%, health check passed, etc.)
 - **Compliance by design**: reference-based payloads, immutable audit logs, and RBAC extensions are architectural decisions that cannot be retrofitted into a workflow engine after the fact
-- **PostgreSQL as shared database**: already needed for KillBill billing. Adding Temporal, CRM state, and audit logs to the same PostgreSQL cluster avoids operational overhead of multiple database systems
+- **PostgreSQL as shared database**: already needed for KillBill billing. Adding Temporal to the same PostgreSQL cluster avoids operational overhead of multiple database systems
 - **No etcd/CRD pressure**: workflow state must live in PostgreSQL, not as Kubernetes custom resources. At 1,000 tenants with frequent operations, CRD-based workflow engines (Tekton, Argo Workflows) would pressure the etcd store that the entire cluster depends on
 - **Go ecosystem alignment**: the Kubernetes ecosystem, Temporal's most mature SDK, and the Cozystack platform are all Go. A single language for BFF, workers, and infrastructure tooling reduces cognitive overhead and dependency sprawl
 - **Monorepo for shared types**: the BFF starts workflows and workers execute them -- both need the same Go types (workflow inputs, activity interfaces). Splitting across repos creates version drift and import cycle headaches. One repo, one `go.mod`, one CI pipeline
@@ -64,9 +63,8 @@ Visibility:  PostgreSQL (same cluster, dedicated database or schema)
 
 Workers (application code):
   bff-worker        -- handles portal-triggered workflows
-  lifecycle-worker  -- handles app upgrade, backup, rollout activities
+  lifecycle-worker  -- handles app upgrade, backup, rollout, GitOps commit activities
   billing-worker    -- handles payment escalation, KillBill integration
-  comms-worker      -- handles email dispatch, CRM event recording
 ```
 
 **Resource estimate (low-concurrency starting point):**
@@ -78,7 +76,7 @@ Workers (application code):
 | Matching | 0.25 core | 256 Mi | 1 |
 | Worker | 0.25 core | 256 Mi | 1 |
 | **Total Temporal** | **1.5 cores** | **1.5 Gi** | **4 pods** |
-| Application workers | 0.5 core each | 256 Mi each | 4 pods |
+| Application workers | 0.5 core each | 256 Mi each | 3 pods |
 
 Scale replicas as concurrency grows. Temporal's history service can be sharded across replicas when needed.
 
@@ -86,42 +84,47 @@ Scale replicas as concurrency grows. Temporal's history service can be sharded a
 
 The BFF (from ADR-002) and all Temporal worker processes are written in Go.
 
-**BFF responsibilities expand from ADR-002:**
+**BFF responsibilities (revised from ADR-002):**
 
 ```
-ADR-002 BFF:
-  - Validate Keycloak tokens
-  - Proxy K8s API requests
-  - Commit tenant resources to GitOps repo
-  - Connect OpenCost to KillBill
+BFF reads from:
+  - Kubernetes API (tenant status, app status -- proxied with RBAC)
+  - OpenCost (cost/usage data for display to users)
+  - KillBill (billing, invoices, subscriptions for display to users)
+  - Temporal (workflow status via queries)
+  - External CRM (customer timeline for display -- CRM choice TBD)
 
-ADR-003 BFF additions:
-  - Start Temporal workflows (onboarding, upgrade, etc.)
-  - Signal workflows (approve/reject, manual override)
-  - Query workflow state (for portal real-time display)
-  - Expose CRM timeline API (read from audit/event store)
-  - Validate workflow RBAC (Keycloak groups → workflow permissions)
+BFF writes to:
+  - Temporal only (start workflows, send signals)
+
+BFF does NOT:
+  - Commit to GitOps repo (Temporal worker activities do this)
+  - Send email (external CRM / comms system handles this)
+  - Own CRM data (reads from external CRM)
+  - Connect OpenCost to KillBill (displays both independently)
 ```
 
-The BFF does NOT contain workflow logic. It is a thin gateway that translates HTTP/WebSocket requests from the portal into Temporal workflow operations. All business logic lives in Temporal workflow and activity definitions.
+The BFF is a thin read-gateway + Temporal trigger. It translates HTTP/WebSocket requests from the portal into Temporal workflow operations and reads from multiple backends for display. All business logic and side effects live in Temporal workflow and activity definitions.
 
 ### 3. PostgreSQL as Shared Persistence
 
-A single PostgreSQL cluster (with logical separation) serves all platform data needs:
+A single PostgreSQL cluster (with logical separation) serves platform data needs:
 
 | Database / Schema | Owner | Purpose |
 |---|---|---|
 | `temporal` | Temporal cluster | Workflow execution state |
 | `temporal_visibility` | Temporal cluster | Workflow search and filtering |
 | `killbill` | KillBill | Billing, subscriptions, invoices |
-| `portal` | BFF | CRM timeline, audit log, portal metadata |
+
+The portal (BFF) does not own a database. It reads from Temporal, KillBill, OpenCost, Kubernetes API, and an external CRM. If the chosen CRM is PostgreSQL-backed and co-located on this cluster, live updates via PostgreSQL LISTEN/NOTIFY become straightforward -- but this depends on the CRM choice (separate decision).
 
 **Why shared PostgreSQL:**
 
 - Temporal requires PostgreSQL (or MySQL/Cassandra). PostgreSQL is already needed for KillBill
-- Operational overhead of one database cluster vs. three-four is significant at small team scale
+- Operational overhead of one database cluster vs. multiple is significant at small team scale
 - Logical separation (separate databases within one cluster) provides isolation without operational cost
 - Backup and HA is configured once for the cluster
+- If the CRM is also PostgreSQL-backed, it can join this cluster -- one more database in the same cluster
 - Can split into separate clusters later if load requires it
 
 ### 4. Flagger for Progressive App Delivery
@@ -142,65 +145,27 @@ Temporal Workflow: "app_upgrade"
 
 Flagger adds one CRD (`Canary`) to the cluster. Traffic shifting is based on Kubernetes Gateway API or Istio/Linkerd service mesh metrics. Flagger handles the mechanics of canary analysis; Temporal orchestrates the full lifecycle around it.
 
-### 5. SendGrid for Internal Platform Email
+### 5. CRM and Email: External System, Not Portal-Owned
 
-Platform-generated emails (welcome, payment reminders, service status changes) are sent via SendGrid API.
+CRM (customer timeline, interaction tracking) and email (welcome, payment reminders, notifications) are **not part of the portal**. The portal's BFF reads from the CRM for display; it does not own the CRM data model, email templates, or delivery infrastructure.
 
-**Scope:** Internal platform communication only. Tenant-facing email (tenants sending email from their own apps) is out of scope for this ADR.
+**What the portal does:**
+- BFF reads CRM timeline data for display in the frontend (API TBD, depends on CRM choice)
+- BFF reads workflow status from Temporal for live progress display
+- Temporal workflows may call CRM/email APIs as activities (the integration depends on CRM choice)
 
-**Integration point:** The `comms-worker` Temporal worker calls the SendGrid API as a workflow activity. Email dispatch is never fire-and-forget -- it is a recorded step in a workflow with delivery status tracking.
+**What the portal does NOT do:**
+- Own a `crm_timeline` table or any CRM data model
+- Send email directly (no SendGrid, no email templates in the portal)
+- Record CRM events (that's the CRM system's responsibility)
 
-```
-Email Activity:
-  Input:  { template_id, recipient_ref, tenant_id, context_data }
-  Action: resolve recipient email from Keycloak (by ref, not stored in payload)
-          call SendGrid API
-          record delivery status
-  Output: { message_id, status, timestamp }
+**CRM choice is a separate, unresolved decision.** It determines:
+- How the BFF reads timeline data (REST API, direct PostgreSQL query, GraphQL)
+- How Temporal workers record events (CRM API call as activity, database write, message queue)
+- Whether live updates are easy (PostgreSQL-backed CRM on same cluster = LISTEN/NOTIFY) or require polling/webhooks
+- Email provider and template management
 
-  Retry:  Temporal activity retry policy (3 attempts, exponential backoff)
-  Record: CRM timeline event created for every send attempt
-```
-
-### 6. CRM / Customer Communication Tracking
-
-Every customer-facing interaction is recorded as a timeline event in the portal database. This is not a separate CRM product -- it is a first-class feature of the portal, powered by Temporal workflow events.
-
-**CRM timeline event sources:**
-
-| Source | Events Recorded |
-|---|---|
-| Onboarding workflow | Tenant created, billing setup, welcome email sent, first app provisioned |
-| Payment workflow | Invoice generated, payment attempted, payment failed, reminder sent, service suspended |
-| App lifecycle workflow | Upgrade started, backup created, canary at X%, promoted/rolled back, user notified |
-| Support interaction | Ticket created, response sent, ticket resolved (future integration) |
-| Admin action | Manual service override, plan change, account note added |
-| Auth events | User invited, user joined, role changed |
-
-**CRM data model (portal database):**
-
-```sql
--- Timeline events (append-only, immutable)
-CREATE TABLE crm_timeline (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       TEXT NOT NULL,
-    actor_ref       TEXT NOT NULL,         -- Keycloak user ID or "system"
-    event_type      TEXT NOT NULL,         -- e.g., "email.sent", "app.upgrade.started"
-    event_source    TEXT NOT NULL,         -- e.g., "workflow:app_upgrade", "admin:manual"
-    workflow_id     TEXT,                  -- Temporal workflow ID (nullable for non-workflow events)
-    workflow_run_id TEXT,                  -- Temporal run ID
-    subject_ref     TEXT,                  -- entity this event is about (user ref, app ref)
-    summary         TEXT NOT NULL,         -- human-readable summary (no PII)
-    metadata        JSONB,                -- structured event data (no PII -- references only)
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_crm_timeline_tenant ON crm_timeline (tenant_id, created_at DESC);
-CREATE INDEX idx_crm_timeline_subject ON crm_timeline (subject_ref, created_at DESC);
-CREATE INDEX idx_crm_timeline_workflow ON crm_timeline (workflow_id);
-```
-
-**No PII in timeline events.** The `actor_ref` and `subject_ref` are Keycloak user IDs. The portal resolves these to names/emails at display time by querying Keycloak. If a user exercises GDPR right to erasure, the timeline events remain intact but the references become unresolvable -- effectively anonymized.
+**Reference-based payloads still apply.** Regardless of CRM choice, Temporal workflow inputs must use reference IDs (Keycloak user IDs, KillBill account refs), never PII. The CRM resolves references to display names at read time.
 
 ### 7. Compliance Architecture
 
@@ -213,11 +178,13 @@ Layer 1: Workflow Execution State (Temporal PostgreSQL)
   - Contains NO PII: payloads use reference IDs only
   - Retention: 24 months (configurable per namespace)
 
-Layer 2: Audit / CRM Log (Portal PostgreSQL)
-  - Append-only: crm_timeline table, no UPDATE or DELETE permissions for application
+Layer 2: Audit / CRM Log (External CRM)
+  - Append-only timeline of customer interactions
   - Contains: who did what, when, with what outcome
   - Contains NO PII: actor_ref and subject_ref are Keycloak IDs
-  - Retention: 36+ months (audit), 7 years (payment-related)
+  - Owned and managed by the CRM system (not the portal)
+  - Portal BFF reads from this layer for display
+  - Retention: governed by CRM system configuration
 
 Layer 3: PII Store (Keycloak + KillBill)
   - Mutable: subject to GDPR erasure requests
@@ -255,25 +222,27 @@ func (a *Activities) SendWelcomeEmail(ctx context.Context, input SendEmailInput)
 
 | Keycloak Group | Permissions |
 |---|---|
-| `platform-workflow-viewer` | View workflow executions and CRM timeline across all tenants |
+| `platform-workflow-viewer` | View workflow executions across all tenants |
 | `platform-workflow-operator` | Trigger, signal, retry, cancel workflows across all tenants |
 | `platform-workflow-admin` | Deploy workflow definitions, manage schedules, configure retention |
-| `{tenant}-view` (existing) | View CRM timeline and workflow status for own tenant |
+| `{tenant}-view` (existing) | View workflow status and CRM timeline for own tenant |
 | `{tenant}-admin` (existing) | Trigger tenant-scoped workflows (request upgrade, etc.) |
 
 The BFF validates Keycloak token group claims before proxying any workflow operation to Temporal.
 
 ### 8. Portal Visibility into Workflows
 
-The portal frontend displays workflow state using Refine's `liveProvider` (from ADR-001) connected to the BFF via WebSocket/SSE:
+The portal frontend displays workflow state and CRM data using Refine's `liveProvider` (from ADR-001) connected to the BFF via WebSocket/SSE:
 
 ```
 User Experience:
 
 Tenant Dashboard:
-  - CRM timeline: scrollable feed of all events for this tenant
-  - Active workflows: cards showing current step, progress, duration
+  - CRM timeline: scrollable feed of all events for this tenant (read from external CRM)
+  - Active workflows: cards showing current step, progress, duration (read from Temporal)
   - App status: current version, last upgrade result, next scheduled backup
+  - Cost overview: OpenCost data for this tenant
+  - Billing status: KillBill subscription, invoices, payment status
 
 App Upgrade View:
   - Step indicator: backup → canary 10% → canary 50% → canary 100% → promoted
@@ -282,11 +251,15 @@ App Upgrade View:
   - History: previous upgrades with outcome and duration
 
 BFF Implementation:
-  - GET  /api/v1/tenants/{id}/timeline      → query crm_timeline table
+  - GET  /api/v1/tenants/{id}/timeline       → read from external CRM (API TBD)
+  - GET  /api/v1/tenants/{id}/costs          → read from OpenCost
+  - GET  /api/v1/tenants/{id}/billing        → read from KillBill
   - GET  /api/v1/workflows/{id}/status       → Temporal QueryWorkflow
   - POST /api/v1/workflows/{id}/signal/{name} → Temporal SignalWorkflow
-  - WS   /api/v1/tenants/{id}/events         → stream timeline + workflow updates
+  - WS   /api/v1/tenants/{id}/events         → stream workflow updates (+ CRM if live-capable)
 ```
+
+**Live updates depend on CRM choice.** If the CRM uses PostgreSQL on the same cluster, the BFF can use LISTEN/NOTIFY for near-real-time timeline updates. If the CRM is SaaS-based, the BFF may need to poll or receive webhooks. Temporal workflow status is always live via Temporal queries.
 
 ### 9. Monorepo: Frontend, BFF, and Workers in One Repository
 
@@ -305,11 +278,9 @@ platform-v1-portal/
   cmd/                         # Go binary entry points
     bff/                       # BFF server (HTTP/WS + Temporal client)
       main.go
-    worker-lifecycle/          # App upgrade, backup activities
+    worker-lifecycle/          # App upgrade, backup, GitOps commit activities
       main.go
     worker-billing/            # Payment escalation, KillBill activities
-      main.go
-    worker-comms/              # Email dispatch, CRM recording
       main.go
 
   internal/                    # Shared Go packages (not importable externally)
@@ -319,21 +290,15 @@ platform-v1-portal/
       app_upgrade/
       service_lifecycle/
       backup/
-      campaign/
       gdpr_erasure/
     activities/                # Activity implementations (imported by workers)
       keycloak/                # Keycloak user resolution
       killbill/                # KillBill billing operations
       gitops/                  # Git commit to GitOps repo
-      sendgrid/                # Email dispatch
       flagger/                 # Canary status polling
-      crm/                     # CRM timeline event recording
       k8s/                     # Kubernetes API operations
     auth/                      # Keycloak token validation, RBAC checks
     config/                    # Shared configuration loading
-    db/                        # PostgreSQL connection, migrations
-
-  migrations/                  # SQL migrations (portal database)
   deploy/                      # Helm charts / Kustomize overlays
   docs/                        # Research and ADRs (existing)
 
@@ -390,20 +355,21 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 
 ### Positive
 
-- **Full visibility from day one**: every customer interaction is tracked. No retroactive data migration needed
+- **BFF stays thin**: the portal's backend is a read-gateway + Temporal trigger. No database, no email, no CRM writes. Easy to reason about, easy to test
 - **Durable execution**: workflows survive pod restarts, node failures, and cluster upgrades. No lost state
 - **Composable lifecycle**: app upgrade = backup activity + GitOps commit activity + Flagger polling activity. Each piece is independently testable and reusable
 - **Compliance built-in**: reference-based payloads and three-layer separation are enforced at the architecture level, not bolted on
 - **Single language, single repo**: Go for BFF, workers, and infrastructure tooling. One `go.mod`, one CI pipeline, one PR review for the full stack. Workflow type changes are compile-time errors, not runtime surprises
 - **Progressive delivery without custom code**: Flagger handles canary analysis mechanics. Temporal handles the orchestration around it
 - **GitOps audit trail preserved**: workflow-triggered changes still flow through git (Flux reconciles). Temporal adds the "why" and "who" that git commits alone don't capture
+- **CRM flexibility**: because CRM is external, the platform can adopt any CRM system without refactoring the portal. The portal just reads from it
 
 ### Negative
 
-- **Temporal operational overhead**: four additional services to run and monitor. Mitigated by Helm chart and low starting resource requirements
-- **PostgreSQL becomes critical path**: all platform state depends on PostgreSQL availability. Mitigated by standard HA (streaming replication, automated failover)
+- **Temporal operational overhead**: four Temporal services to run and monitor (installed via infra repo, not portal). Mitigated by Helm chart and low starting resource requirements
+- **PostgreSQL becomes critical path**: Temporal and KillBill depend on PostgreSQL availability. Mitigated by standard HA (streaming replication, automated failover)
 - **Learning curve**: Temporal's programming model (deterministic workflow code, activity separation) requires developer education
-- **SendGrid vendor dependency**: email delivery depends on external SaaS. Mitigated by activity-level abstraction (swap SendGrid activity for another provider without changing workflows)
+- **CRM choice is unresolved**: the portal's timeline display, live updates, and workflow-to-CRM integration all depend on a CRM decision that hasn't been made yet. This is the most significant open dependency
 - **Monorepo CI complexity**: CI must detect which paths changed to avoid rebuilding everything on every commit. Mitigated by path-based build triggers (standard pattern in GitHub Actions / Forgejo CI)
 
 ### Risks
@@ -413,16 +379,16 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 | Temporal cluster failure halts all workflows | Temporal is designed for HA (multiple replicas per service). In-flight workflows resume automatically on recovery. Start with single replicas, scale to HA before production. |
 | PostgreSQL overload from shared usage | Logical separation (separate databases) prevents query interference. Monitor connection pools and query performance. Split into separate clusters if needed. |
 | Flagger canary analysis produces false positives/negatives | Start with conservative thresholds. Temporal workflow allows manual override via signal. Iterate on metrics and thresholds over time. |
-| CRM timeline table grows unbounded | Partition by `created_at`. Archive partitions older than retention policy to cold storage. Implement read-through cache for recent events. |
-| SendGrid deliverability or API outage | Temporal activity retry policy handles transient failures. For sustained outage, workflow pauses and resumes when SendGrid recovers. Alert on prolonged email delivery failures. |
+| CRM choice blocks portal timeline feature | The BFF's timeline display and live updates depend on CRM choice. Mitigate by defining a minimal CRM read interface early; swap implementations behind it. |
 | Reference-based payload discipline slips | Enforce via code review + linting rules that flag string fields matching PII patterns in workflow/activity input structs. CI check prevents merge. |
 
 ## Impact on Related Decisions
 
-- **ADR-001 (Frontend)**: Refine's `liveProvider` connects to BFF WebSocket for real-time workflow state and CRM timeline updates. Workflow status components use Refine's `useCustom` hooks to query/signal Temporal through the BFF
-- **ADR-002 (Architecture)**: BFF role expands from "GitOps commit gateway" to "workflow orchestration gateway". Tenant provisioning becomes a Temporal workflow (with the GitOps commit as one activity within it). Keycloak groups extended with `platform-workflow-*` roles
-- **Issue #6 (Onboarding)**: Onboarding is now a Temporal workflow. Wizard submission starts the workflow; portal shows real-time progress via workflow queries
+- **ADR-001 (Frontend)**: Refine's `liveProvider` connects to BFF WebSocket for real-time workflow state updates. CRM timeline display depends on CRM choice (separate decision). Workflow status components use Refine's `useCustom` hooks to query/signal Temporal through the BFF
+- **ADR-002 (Architecture)**: BFF role changes from "GitOps commit gateway" to "read gateway + Temporal trigger". BFF no longer commits to GitOps directly -- Temporal worker activities do. Keycloak groups extended with `platform-workflow-*` roles
+- **Issue #6 (Onboarding)**: Onboarding is a Temporal workflow. Wizard submission starts the workflow; portal shows real-time progress via workflow queries
 - **Future: Billing Integration**: KillBill webhook events trigger Temporal workflows (payment escalation, plan changes). The billing worker translates KillBill events into workflow signals
+- **Future: CRM Choice**: Separate decision required. Determines how the portal displays customer timeline, how Temporal workers record events, and whether live updates use LISTEN/NOTIFY or polling
 
 ## References
 
@@ -431,4 +397,3 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 - [Temporal Documentation](https://docs.temporal.io/)
 - [Temporal Go SDK](https://github.com/temporalio/sdk-go)
 - [Flagger Documentation](https://docs.flagger.app/)
-- [SendGrid Go SDK](https://github.com/sendgrid/sendgrid-go)
