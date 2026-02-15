@@ -13,7 +13,7 @@ The portal is a single SPA that authenticates users via Cozystack's Keycloak rea
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Auth model | Cozystack single Keycloak realm + Kubernetes RBAC | No custom auth. Users are Keycloak users, permissions are Keycloak groups mapped to K8s RoleBindings. |
-| Tenant provisioning | BFF commits HelmRelease to gitops repo | Flux picks up changes, creates/deletes tenants. Portal never talks to K8s API directly for provisioning. |
+| Tenant provisioning | BFF commits tenant resource to gitops repo (one file per tenant) | Flux picks up changes, creates/deletes tenants. Portal never talks to K8s API directly for provisioning. |
 | Per-tenant portal | Not for MVP | Users use Cozystack dashboard, Grafana, etc. for deeper management. Main portal links to these. |
 | JWT token tuning | None for MVP | Accept default proxy header limits. Document scaling ceiling. |
 | Scale target | < 1,000 tenants | Beyond this, adopt multi-cluster model for blast radius and reliability. |

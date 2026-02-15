@@ -50,14 +50,14 @@
 
 ### FluxCD Reconciliation
 
-| HelmReleases | Full reconciliation time |
+| tenant resources | Full reconciliation time |
 |---|---|
 | 100 | ~27s |
 | 500 | ~2m 9s |
 | 1,000 | ~4m 35s |
 | 3,000+ | Sharding required |
 
-**Throughput:** ~220 HelmReleases/minute. Sharding is label-based -- each shard handles ~1,000 HelmReleases independently.
+**Throughput:** ~220 tenant resources/minute. Sharding is label-based -- each shard handles ~1,000 tenant resources independently.
 
 ### Cilium Network Policy
 
@@ -75,7 +75,7 @@ At 1,000 namespaces with ~10 workloads each = ~10,000 identities. Within default
 | Objects per namespace | ~3,000 |
 | Total etcd object count | Millions (with appropriate compaction) |
 
-Each tenant namespace creates ~10-15 objects (ServiceAccount, Secrets, RoleBindings, NetworkPolicies, HelmRelease).
+Each tenant namespace creates ~10-15 objects (ServiceAccount, Secrets, RoleBindings, NetworkPolicies, tenant resource).
 
 ## Decision
 
