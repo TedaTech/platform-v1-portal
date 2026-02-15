@@ -31,8 +31,6 @@ The platform will also host CRM instances for customers, so operational experien
 3. **SuiteCRM** — standalone CRM+marketing, MySQL-only
 4. **Erxes** — SSO only in paid Enterprise tier, MongoDB-only
 
-See `crm-landscape-research.md` for the full evaluation.
-
 ## Decision
 
 **EspoCRM** for CRM. **Mautic** for marketing automation and email campaigns.
