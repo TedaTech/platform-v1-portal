@@ -19,6 +19,7 @@ All multi-step business processes (onboarding, payment escalation, app lifecycle
 | Internal email | SendGrid | Managed deliverability. Activity-level abstraction allows future swap. Tenant email out of scope |
 | CRM tracking | First-class from day one | Every customer interaction recorded as timeline event. Reference-based (no PII in events) |
 | Compliance model | Three-layer separation | PII (Keycloak/KillBill) separated from workflow state (Temporal) and audit log (portal DB). GDPR erasure = delete PII, timeline auto-anonymizes |
+| Repository structure | Monorepo | Frontend, BFF, and all workers in one repo. Shared Go types, one CI pipeline, one PR for full-stack changes. Separate build targets per component |
 
 ### Workflow Catalog
 

@@ -30,6 +30,7 @@ ADR-002 established that the BFF commits resources to a GitOps repo and Flux rec
 - **PostgreSQL as shared database**: already needed for KillBill billing. Adding Temporal, CRM state, and audit logs to the same PostgreSQL cluster avoids operational overhead of multiple database systems
 - **No etcd/CRD pressure**: workflow state must live in PostgreSQL, not as Kubernetes custom resources. At 1,000 tenants with frequent operations, CRD-based workflow engines (Tekton, Argo Workflows) would pressure the etcd store that the entire cluster depends on
 - **Go ecosystem alignment**: the Kubernetes ecosystem, Temporal's most mature SDK, and the Cozystack platform are all Go. A single language for BFF, workers, and infrastructure tooling reduces cognitive overhead and dependency sprawl
+- **Monorepo for shared types**: the BFF starts workflows and workers execute them -- both need the same Go types (workflow inputs, activity interfaces). Splitting across repos creates version drift and import cycle headaches. One repo, one `go.mod`, one CI pipeline
 
 ## Decision
 
@@ -287,6 +288,104 @@ BFF Implementation:
   - WS   /api/v1/tenants/{id}/events         → stream timeline + workflow updates
 ```
 
+### 9. Monorepo: Frontend, BFF, and Workers in One Repository
+
+The React frontend, Go BFF, and all Temporal workers live in a single repository (`platform-v1-portal`). Each is a separate build target producing a separate container image, but they share one git history, one CI pipeline, and one PR review process.
+
+**Repository structure:**
+
+```
+platform-v1-portal/
+  frontend/                    # React SPA (ADR-001)
+    src/
+    package.json
+    vite.config.ts
+    Dockerfile                 # → nginx:alpine static SPA image
+
+  cmd/                         # Go binary entry points
+    bff/                       # BFF server (HTTP/WS + Temporal client)
+      main.go
+    worker-lifecycle/          # App upgrade, backup activities
+      main.go
+    worker-billing/            # Payment escalation, KillBill activities
+      main.go
+    worker-comms/              # Email dispatch, CRM recording
+      main.go
+
+  internal/                    # Shared Go packages (not importable externally)
+    workflows/                 # Workflow definitions (imported by BFF to start, workers to execute)
+      onboarding/
+      payment_escalation/
+      app_upgrade/
+      service_lifecycle/
+      backup/
+      campaign/
+      gdpr_erasure/
+    activities/                # Activity implementations (imported by workers)
+      keycloak/                # Keycloak user resolution
+      killbill/                # KillBill billing operations
+      gitops/                  # Git commit to GitOps repo
+      sendgrid/                # Email dispatch
+      flagger/                 # Canary status polling
+      crm/                     # CRM timeline event recording
+      k8s/                     # Kubernetes API operations
+    auth/                      # Keycloak token validation, RBAC checks
+    config/                    # Shared configuration loading
+    db/                        # PostgreSQL connection, migrations
+
+  migrations/                  # SQL migrations (portal database)
+  deploy/                      # Helm charts / Kustomize overlays
+  docs/                        # Research and ADRs (existing)
+
+  go.mod                       # Single Go module
+  go.sum
+  Makefile                     # Build targets: make bff, make worker-lifecycle, etc.
+  Dockerfile.bff               # Multi-stage: build Go → scratch/distroless
+  Dockerfile.worker            # Shared base for all workers (arg selects cmd/)
+```
+
+**Why monorepo over multi-repo:**
+
+| Concern | Monorepo | Multi-repo |
+|---|---|---|
+| Shared types (workflow inputs, activity interfaces) | Single `internal/` package, always in sync | Cross-repo imports, version pinning, release coordination |
+| Refactoring a workflow | One PR touches definition + activity + BFF endpoint | Three PRs across three repos, must merge in correct order |
+| CI/CD | One pipeline, matrix builds per target | Three pipelines, cross-repo triggering |
+| Code review | Reviewer sees full context (trigger → workflow → activity) | Reviewer sees partial picture per repo |
+| Compliance audit trail | One PR = one reviewable change for the full feature | Auditor must correlate commits across repos |
+| Go module management | One `go.mod`, one dependency tree | Three `go.mod` files, potential version drift on shared deps |
+| Temporal versioning | Worker and BFF always built from same commit | Risk of BFF starting workflows that workers don't understand yet |
+
+**Build and deploy independence:**
+
+Despite being a monorepo, each component builds and deploys independently:
+
+- `make frontend` → builds React SPA, produces `portal-frontend:sha` image
+- `make bff` → builds Go BFF binary, produces `portal-bff:sha` image
+- `make worker-lifecycle` → builds lifecycle worker, produces `portal-worker-lifecycle:sha` image
+- CI detects which paths changed and only builds/deploys affected images
+- Flux watches each image independently (frontend, BFF, and workers can roll out at different times)
+
+**Temporal type safety across BFF and workers:**
+
+The critical benefit: workflow input/output types are defined once in `internal/workflows/` and imported by both the BFF (which starts workflows) and the workers (which execute them). A type change is a compile error in both the BFF and worker at the same time, caught in the same CI run. In a multi-repo setup, this mismatch would only surface at runtime.
+
+```go
+// internal/workflows/app_upgrade/types.go
+type AppUpgradeInput struct {
+    TenantID        string
+    AppRef          string
+    TargetVersion   string
+    RolloutStrategy string // "canary" | "blue-green"
+}
+
+// cmd/bff/main.go — starts the workflow
+client.ExecuteWorkflow(ctx, opts, app_upgrade.Workflow, input)
+
+// cmd/worker-lifecycle/main.go — registers the workflow
+w.RegisterWorkflow(app_upgrade.Workflow)
+```
+
 ## Consequences
 
 ### Positive
@@ -295,7 +394,7 @@ BFF Implementation:
 - **Durable execution**: workflows survive pod restarts, node failures, and cluster upgrades. No lost state
 - **Composable lifecycle**: app upgrade = backup activity + GitOps commit activity + Flagger polling activity. Each piece is independently testable and reusable
 - **Compliance built-in**: reference-based payloads and three-layer separation are enforced at the architecture level, not bolted on
-- **Single language**: Go for BFF, workers, and infrastructure tooling. One dependency chain, one build pipeline, one team skill set
+- **Single language, single repo**: Go for BFF, workers, and infrastructure tooling. One `go.mod`, one CI pipeline, one PR review for the full stack. Workflow type changes are compile-time errors, not runtime surprises
 - **Progressive delivery without custom code**: Flagger handles canary analysis mechanics. Temporal handles the orchestration around it
 - **GitOps audit trail preserved**: workflow-triggered changes still flow through git (Flux reconciles). Temporal adds the "why" and "who" that git commits alone don't capture
 
@@ -305,6 +404,7 @@ BFF Implementation:
 - **PostgreSQL becomes critical path**: all platform state depends on PostgreSQL availability. Mitigated by standard HA (streaming replication, automated failover)
 - **Learning curve**: Temporal's programming model (deterministic workflow code, activity separation) requires developer education
 - **SendGrid vendor dependency**: email delivery depends on external SaaS. Mitigated by activity-level abstraction (swap SendGrid activity for another provider without changing workflows)
+- **Monorepo CI complexity**: CI must detect which paths changed to avoid rebuilding everything on every commit. Mitigated by path-based build triggers (standard pattern in GitHub Actions / Forgejo CI)
 
 ### Risks
 
