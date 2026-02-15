@@ -10,6 +10,7 @@ Research phase. No code yet.
 
 - [001 — Frontend Tech Stack](./docs/research/001-frontend-tech-stack/README.md) — Framework selection for the portal SPA
 - [002 — Architecture](./docs/research/002-architecture/README.md) — Portal architecture, tenant model, and scaling limits
+- [003 — Platform Orchestration](./docs/research/003-platform-orchestration/README.md) — Temporal workflows, CRM tracking, Flagger, compliance
 
 ## Architecture
 
