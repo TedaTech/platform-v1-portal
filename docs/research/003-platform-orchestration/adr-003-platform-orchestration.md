@@ -1,4 +1,4 @@
-# ADR-003: Platform Orchestration, Workflow Engine, and CRM
+# ADR-003: Platform Orchestration and Workflow Engine
 
 ## Status
 
@@ -12,15 +12,13 @@ Proposed
 
 The Customer Portal needs to orchestrate complex, multi-step business processes that span seconds to weeks:
 
-- **Customer onboarding**: tenant creation, billing setup, welcome communication, initial app provisioning
-- **Payment escalation**: failed payment detection, retry logic, customer notification, grace period, service suspension
+- **Customer onboarding**: tenant creation, billing setup, initial app provisioning
 - **App lifecycle**: backup, progressive rollout (canary/blue-green), health verification, automatic rollback on failure
-- **Service disabling/re-enabling**: triggered by billing events or admin action, with notification workflows
-- **Customer communication tracking**: every interaction (email, support, billing event, status change) recorded as a CRM timeline from day one
+- **GDPR data erasure**: coordinated deletion across multiple systems with human verification
 
-These workflows must survive infrastructure restarts, support human-in-the-loop decisions (approval gates, manual overrides), and provide full audit trails for GDPR, SOC 2, and ISO 27001 compliance.
+These workflows must survive infrastructure restarts, support human-in-the-loop decisions (approval gates, manual overrides), and provide audit trails for compliance.
 
-ADR-002 established that the BFF commits resources to a GitOps repo and Flux reconciles them. This ADR extends that model: the BFF now also starts and signals Temporal workflows, which orchestrate the full lifecycle around those GitOps commits.
+ADR-002 established the BFF as a thin gateway that starts Temporal workflows and reads from multiple backends. This ADR defines the Temporal workflow architecture: the BFF starts and signals workflows, Temporal workers execute all business logic and side effects (GitOps commits, external API calls).
 
 ## Decision Drivers
 
@@ -35,7 +33,7 @@ ADR-002 established that the BFF commits resources to a GitOps repo and Flux rec
 
 ### 1. Temporal (Self-Hosted) as Central Workflow Orchestrator
 
-All multi-step business processes run as Temporal workflows. Temporal is deployed self-hosted on the same Kubernetes cluster, using PostgreSQL as its persistence backend.
+All multi-step business processes run as Temporal workflows. Temporal is a portal component, deployed self-hosted on the same Kubernetes cluster. It uses PostgreSQL as its persistence backend (PostgreSQL is provided by the infra layer).
 
 **Why Temporal over alternatives:**
 
@@ -62,9 +60,8 @@ Persistence: PostgreSQL (shared cluster, dedicated database)
 Visibility:  PostgreSQL (same cluster, dedicated database or schema)
 
 Workers (application code):
-  bff-worker        -- handles portal-triggered workflows
-  lifecycle-worker  -- handles app upgrade, backup, rollout, GitOps commit activities
-  billing-worker    -- handles payment escalation, KillBill integration
+  portal-worker     -- handles all portal workflows (onboarding, app upgrade, GDPR erasure)
+                    -- additional workers can be split out later if needed
 ```
 
 **Resource estimate (low-concurrency starting point):**
@@ -76,7 +73,7 @@ Workers (application code):
 | Matching | 0.25 core | 256 Mi | 1 |
 | Worker | 0.25 core | 256 Mi | 1 |
 | **Total Temporal** | **1.5 cores** | **1.5 Gi** | **4 pods** |
-| Application workers | 0.5 core each | 256 Mi each | 3 pods |
+| Application worker | 0.5 core | 256 Mi | 1 pod |
 
 Scale replicas as concurrency grows. Temporal's history service can be sharded across replicas when needed.
 
@@ -138,8 +135,8 @@ Temporal Workflow: "app_upgrade"
   3. Activity: commit new app version to GitOps repo
   4. Activity: Flux reconciles, Flagger begins canary rollout
   5. Activity: poll Flagger Canary status (progressive traffic shift)
-  6. Activity: if Flagger promotes → record success in CRM timeline
-  7. Activity: if Flagger rolls back → record failure, notify user
+  6. Activity: if Flagger promotes → [CRM] record success
+  7. Activity: if Flagger rolls back → [CRM] record failure, notify user
   8. Signal: user can manually promote or rollback at any step
 ```
 
@@ -278,20 +275,15 @@ platform-v1-portal/
   cmd/                         # Go binary entry points
     bff/                       # BFF server (HTTP/WS + Temporal client)
       main.go
-    worker-lifecycle/          # App upgrade, backup, GitOps commit activities
-      main.go
-    worker-billing/            # Payment escalation, KillBill activities
+    worker/                    # Temporal worker (all workflows + activities)
       main.go
 
   internal/                    # Shared Go packages (not importable externally)
-    workflows/                 # Workflow definitions (imported by BFF to start, workers to execute)
+    workflows/                 # Workflow definitions (imported by BFF to start, worker to execute)
       onboarding/
-      payment_escalation/
       app_upgrade/
-      service_lifecycle/
-      backup/
       gdpr_erasure/
-    activities/                # Activity implementations (imported by workers)
+    activities/                # Activity implementations (imported by worker)
       keycloak/                # Keycloak user resolution
       killbill/                # KillBill billing operations
       gitops/                  # Git commit to GitOps repo
@@ -327,9 +319,9 @@ Despite being a monorepo, each component builds and deploys independently:
 
 - `make frontend` → builds React SPA, produces `portal-frontend:sha` image
 - `make bff` → builds Go BFF binary, produces `portal-bff:sha` image
-- `make worker-lifecycle` → builds lifecycle worker, produces `portal-worker-lifecycle:sha` image
+- `make worker` → builds Temporal worker, produces `portal-worker:sha` image
 - CI detects which paths changed and only builds/deploys affected images
-- Flux watches each image independently (frontend, BFF, and workers can roll out at different times)
+- Flux watches each image independently (frontend, BFF, and worker can roll out at different times)
 
 **Temporal type safety across BFF and workers:**
 
@@ -347,7 +339,7 @@ type AppUpgradeInput struct {
 // cmd/bff/main.go — starts the workflow
 client.ExecuteWorkflow(ctx, opts, app_upgrade.Workflow, input)
 
-// cmd/worker-lifecycle/main.go — registers the workflow
+// cmd/worker/main.go — registers the workflow
 w.RegisterWorkflow(app_upgrade.Workflow)
 ```
 
@@ -366,7 +358,7 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 
 ### Negative
 
-- **Temporal operational overhead**: four Temporal services to run and monitor (installed via infra repo, not portal). Mitigated by Helm chart and low starting resource requirements
+- **Temporal operational overhead**: four Temporal services to run and monitor (portal component, PostgreSQL provided by infra). Mitigated by Helm chart and low starting resource requirements
 - **PostgreSQL becomes critical path**: Temporal and KillBill depend on PostgreSQL availability. Mitigated by standard HA (streaming replication, automated failover)
 - **Learning curve**: Temporal's programming model (deterministic workflow code, activity separation) requires developer education
 - **CRM choice is unresolved**: the portal's timeline display, live updates, and workflow-to-CRM integration all depend on a CRM decision that hasn't been made yet. This is the most significant open dependency
@@ -393,7 +385,6 @@ w.RegisterWorkflow(app_upgrade.Workflow)
 ## References
 
 - [Workflow Catalog](./workflow-catalog.md)
-- [Compliance Architecture](./compliance-architecture.md)
 - [Temporal Documentation](https://docs.temporal.io/)
 - [Temporal Go SDK](https://github.com/temporalio/sdk-go)
 - [Flagger Documentation](https://docs.flagger.app/)
